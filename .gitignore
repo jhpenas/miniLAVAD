@@ -1,0 +1,27 @@
+# Environments
+.venv/
+env/
+__pycache__/
+
+# Data and Models
+data/
+models/
+*.mp4
+*.jpg
+*.png
+
+#notebooks
+notebooks/
+
+# MLOps Tracking
+mlruns/
+mlflow.db
+mlartifacts/
+
+# IDEs
+.vscode/
+.idea/
+.ipynb_checkpoints/
+
+# Other
+FAQ.txt

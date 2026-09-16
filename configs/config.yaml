@@ -1,0 +1,26 @@
+# config.yaml
+project_name: "miniLAVAD_Optimization"
+
+data:
+  train_json_path: "data/processed/train_split.json"
+  val_json_path: "data/processed/val_split.json"
+  num_frames: 10
+  window_size_sec: 10.0
+
+model:
+  name_or_path: "Qwen/Qwen2-VL-2B-Instruct"
+  load_in_4bit: true
+  max_tokens: 50
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "v_proj"]
+
+training:
+  learning_rate: 2e-5
+  batch_size: 1
+  gradient_accumulation_steps: 4
+  epochs: 3
+  output_dir: "models/checkpoints"
