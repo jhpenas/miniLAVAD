@@ -48,8 +48,41 @@ The primary optimization engine. It loads the Qwen2-VL base model using 4-bit NF
 This script explicitly avoids high-level wrappers like Hugging Face's SFTTrainer. SFTTrainer abstracts gradient accumulation and caching in ways that cause unpredictable VRAM spikes during multimodal training. By writing a native loop, we enforce aggressive, surgical memory management—specifically utilizing torch.cuda.empty_cache() and set_to_none=True after every single batch. This guarantees the 2.2B parameter model trains stably within an 8 GB VRAM ceiling. Additionally, it forces mid-training checkpoints at the end of every epoch to prevent data loss.
 
 - `python src/evaluate.py`
-A standalone evaluation script (CCTV Simulator) that loads the saved LoRA adapter checkpoints and runs inference against the isolated CVPR 2018 test split.
-Evaluation and validation are completely decoupled from the train.py script. Running an inline validation loop during training requires PyTorch to simultaneously hold the training computation graph and allocate memory for the inference KV cache. On constrained hardware, this triggers an immediate Out-Of-Memory (OOM) crash. By running evaluation post-hoc on saved checkpoints, we protect the hardware while maintaining strict, academically rigorous benchmark comparisons against state-of-the-art 2025 anomaly detection models.
+### `evaluate.py` (CCTV Inference & Signal Processing Engine)
+
+`python src/evaluate.py [ARGS]`
+
+A standalone evaluation engine that loads the base Vision-Language Model (and optional LoRA adapters) to run mathematically rigorous inference against the isolated CVPR 2018 test split. 
+
+Evaluation and validation are completely decoupled from the `train.py` script. Running an inline validation loop during training requires PyTorch to simultaneously hold the training computation graph and allocate memory for the inference KV cache. On constrained hardware, this triggers an immediate Out-Of-Memory (OOM) crash. By running evaluation post-hoc on saved checkpoints, we protect the hardware while maintaining strict, academically rigorous benchmark comparisons against state-of-the-art 2025 anomaly detection models.
+
+Beyond hardware protection, this script implements a highly specialized pipeline to convert discrete autoregressive text generation into a continuous, frame-accurate mathematical signal for VAD (Video Anomaly Detection) metrics:
+
+#### Core Methodologies
+
+* **Mathematical Logit Extraction:** Instead of relying on brittle string parsing (which is highly vulnerable to VLM hallucination and format bias), the script bypasses the text output entirely for its mathematical scoring. It extracts the raw neural activation logits for the exact token IDs of `Yes` and `No` at the first generation step, applying a Softmax function to calculate a precise continuous probability (e.g., `0.1523`) of an anomaly.
+* **Temperature Scaling for VLM Overconfidence:** Foundational VLMs are heavily polarized, frequently pushing negative logits below PyTorch's 16-bit physical memory limit (`-65,504`), resulting in `-Infinity` underflows and snapping probabilities to a hard `0.0` or `1.0`. The script implements a configurable Temperature Scaling factor (`--temperature`) to soften logit overconfidence, preserving the model's true underlying uncertainty for highly accurate ROC-AUC curves.
+* **Forced Caption Generation (EOS Masking):** To prevent premature early-stopping (where the model outputs a binary answer and immediately drops an `<|im_end|>` token to save compute), the generation block enforces a `min_new_tokens=30` override. This forces the cross-attention layers to visually ground the binary decision by generating a detailed qualitative caption of the physical scene, allowing for deep forensic analysis of model hallucinations.
+* **Dynamic Signal Boundary Processing:** VLM inference on raw 30 FPS video is computationally impossible. The script processes sparse 10-frame temporal chunks, then utilizes a three-step physical signal processor to rebuild a frame-accurate array that perfectly matches the UCA ground-truth annotations:
+  1. **Interpolation:** Stretches the sparse chunk logits across the native frame count.
+  2. **Temporal Smoothing:** Applies a rolling average to eliminate transient logit spikes.
+  3. **Non-Linear Suppression:** Applies power crushing to suppress low-confidence background noise while preserving high-confidence anomaly spikes.
+
+#### Command Line Arguments
+
+| Argument | Type | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--adapter_path` | String | `None` | Path to the trained LoRA weights. If omitted, runs the zero-shot base model. |
+| `--no_quantize` | Flag | `False` | Disables 4-bit NF4 quantization. Forces pure FP16 loading (Requires heavy VRAM). |
+| `--max_frames` | Int | `10` | The number of frames passed to the VLM per temporal chunk. |
+| `--temperature` | Float | `5.0` | Calibrates the Softmax function. `1.0` uses raw logits; higher values soften VLM overconfidence to prevent `-Infinity` underflows. |
+| `--smoothing_window` | Int | `60` | Size of the rolling average window applied to the interpolated signal. `1` disables smoothing. |
+| `--suppression_power` | Float | `2.0` | Exponent applied to the final signal curve to crush low-confidence noise. `1.0` disables suppression. |
+| `--limit` | Int | `None` | Restricts the evaluation to *N* videos for rapid ablation testing and debugging. |
+| `--test_json` | String | `data/processed/test_split.json` | Path to the evaluation dataset index. |
+| `--output_file` | String | `models/eval_results.json` | Destination for the JSON log containing final ROC-AUC scores, raw logits, and forensic captions. |
+
+
 ### 5. Experiment Tracking (MLflow)
 Because fine-tuning multimodal models involves balancing numerous hyperparameters (quantization precision, LoRA rank, visual pixel caps, learning rates), this project relies on MLflow for local experiment tracking.
 
