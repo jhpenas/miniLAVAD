@@ -1,5 +1,5 @@
 # config.yaml
-project_name: "miniLAVAD_Optimization"
+project_name: "miniLAVAD_V3"
 
 data:
   train_json_path: "data/processed/train_split_labeled.json"
@@ -22,5 +22,5 @@ training:
   learning_rate: 2e-5
   batch_size: 1
   gradient_accumulation_steps: 4
-  epochs: 3
+  epochs: 5
   output_dir: "models/checkpoints"

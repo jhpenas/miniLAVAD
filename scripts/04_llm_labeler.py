@@ -4,9 +4,11 @@ import requests
 from pathlib import Path
 from tqdm import tqdm
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
 # Configuration
-INPUT_JSON = "data/processed/train_split.json"
-OUTPUT_JSON = "data/processed/train_split_labeled.json"
+INPUT_JSON = PROJECT_ROOT / "data/processed/train_split.json"
+OUTPUT_JSON = PROJECT_ROOT / "data/processed/train_split_labeled.json"
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL_NAME = "llama3"
 
@@ -48,7 +50,8 @@ def classify_sentence(sentence: str) -> bool:
         res = requests.post(OLLAMA_URL, json={
             "model": MODEL_NAME,
             "prompt": prompt,
-            "stream": False
+            "stream": False,
+            "options": {"temperature": 0.0}
         })
 
         if res.status_code == 200:

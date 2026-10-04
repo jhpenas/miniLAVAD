@@ -125,6 +125,21 @@ def main():
         collate_fn=lambda b: collate_fn(b, processor)
     )
 
+    # Initialize Validation Dataset & Dataloader
+    val_dataset = UCFCrimeTrainingDataset(
+        split_json_path=project_root / config.data.val_json_path,
+        processor=processor,
+        num_frames=config.data.num_frames,
+        window_size_sec=config.data.window_size_sec
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=config.training.batch_size,
+        shuffle=False,  # No need to shuffle validation data
+        collate_fn=lambda b: collate_fn(b, processor)
+    )
+
     # 6. Optimizer & Mixed Precision
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(config.training.learning_rate))
     scaler = torch.cuda.amp.GradScaler()
@@ -168,23 +183,64 @@ def main():
                 del outputs, loss, batch
                 torch.cuda.empty_cache()
 
+            # Flush remaining gradients at the end of the epoch
+            if len(train_loader) % config.training.gradient_accumulation_steps != 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
             avg_epoch_loss = epoch_loss / len(train_loader)
             mlflow.log_metric("epoch_loss", avg_epoch_loss, step=epoch)
             print(f"--- Epoch {epoch + 1} Complete | Average Loss: {avg_epoch_loss:.4f} ---")
 
+            model.eval()  # Switch to evaluation mode
+            epoch_val_loss = 0.0
+
+            with torch.no_grad():  # Do not compute gradients
+                for val_batch in val_loader:
+                    val_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
+
+                    with torch.amp.autocast('cuda', dtype=torch.float16):
+                        val_outputs = model(**val_batch)
+                        epoch_val_loss += val_outputs.loss.item()
+
+            avg_val_loss = epoch_val_loss / len(val_loader)
+            mlflow.log_metric("val_loss", avg_val_loss, step=epoch)
+
+            print(f"--- Epoch {epoch + 1} Complete | Average Val Loss: {avg_val_loss:.4f} ---")
+
             # Ephemeral Mid-Training Checkpointing
             print(f"Securing Epoch {epoch + 1} checkpoint to MLflow...")
-            with tempfile.TemporaryDirectory() as temp_dir:
-                model.save_pretrained(temp_dir)
-                mlflow.log_artifacts(temp_dir, artifact_path=f"checkpoints/epoch_{epoch + 1}")
-            print(f"Epoch {epoch + 1} checkpoint uploaded and local cache cleaned.")
 
-        # 8. Ephemeral Final Model Checkpointing
-        print("Securing final adapter and processor to MLflow...")
-        with tempfile.TemporaryDirectory() as temp_dir:
-            model.save_pretrained(temp_dir)
-            processor.save_pretrained(temp_dir)
-            mlflow.log_artifacts(temp_dir, artifact_path="final_adapter")
+            # Bundle both the model and processor so this intermediate
+            # epoch is a fully functional, deployable model.
+            components = {
+                "model": model,
+                "processor": processor
+            }
+
+            # Log natively, using the dynamic epoch number for the path
+            mlflow.transformers.log_model(
+                transformers_model=components,
+                artifact_path=f"checkpoints/epoch_{epoch + 1}",
+                task="text-generation"
+            )
+
+            print(f"Epoch {epoch + 1} checkpoint uploaded.")
+
+        # 8. Native MLflow Model Checkpointing
+        print("Securing final adapter and processor to MLflow as a Model...")
+
+        components = {
+            "model": model,
+            "processor": processor
+        }
+
+        mlflow.transformers.log_model(
+            transformers_model=components,
+            artifact_path="final_adapter",
+            task="text-generation"  # Tells MLflow what kind of pipeline this is
+        )
 
         print("Training complete! All weights and configs safely recorded in MLflow.")
 
