@@ -1,6 +1,7 @@
 # Environments
 .venv/
 env/
+.env
 __pycache__/
 
 # Data and Models
@@ -24,4 +25,5 @@ mlartifacts/
 .ipynb_checkpoints/
 
 # Other
-FAQ.txt
+FAQ.txt.env
+.env

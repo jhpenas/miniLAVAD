@@ -17,6 +17,7 @@ class UCFCrimeTrainingDataset(Dataset):
     ):
         """
         Unified DataLoader exclusively for Training and Validation splits.
+        Consumes LLM-labeled UCA dense captions to enable robust Intra-Video Negative Sampling.
         """
         super().__init__()
         self.processor = processor
@@ -25,10 +26,9 @@ class UCFCrimeTrainingDataset(Dataset):
 
         if prompt_template is None:
             self.prompt_template = (
-                "You are an AI surveillance assistant. Analyze this video for any suspicious or anomalous behavior. "
-                "You MUST output your response in this exact format: '[Probability: X.XX] Description'. "
-                "X.XX must be a float between 0.00 (completely normal) and 1.00 (definite anomaly). "
-                "Follow this with a detailed description of the scene."
+                "Is there any suspicious or anomalous behavior (such as fighting, violence, abuse, stealing, or accidents) happening in this video clip? "
+                "Answer with exactly 'Yes.' or 'No.' as your very first word. "
+                "Then, on a new line, provide a detailed, objective description of exactly what is happening in the scene."
             )
         else:
             self.prompt_template = prompt_template
@@ -54,11 +54,10 @@ class UCFCrimeTrainingDataset(Dataset):
         start_frame = int(start_sec * fps)
         end_frame = int((start_sec + self.window_size_sec) * fps)
 
-        # Prevent out-of-bounds errors
         start_frame = max(0, min(start_frame, total_frames - 1))
         end_frame = max(0, min(end_frame, total_frames - 1))
 
-        if start_frame == end_frame:
+        if start_frame >= end_frame:
             return None
 
         indices = np.linspace(start_frame, end_frame, self.num_frames, dtype=int)
@@ -67,6 +66,12 @@ class UCFCrimeTrainingDataset(Dataset):
     def __getitem__(self, idx):
         item = self.data[idx]
         label = item["label"]
+
+        sentences = item.get("uca_data", {}).get("sentences", [])
+        timestamps = item.get("uca_data", {}).get("timestamps", [])
+
+        if not sentences or not timestamps or len(sentences) != len(timestamps):
+            return self.__getitem__((idx + 1) % len(self))
 
         video_filename = Path(item["video_path"]).name
         if video_filename not in self.video_index:
@@ -83,31 +88,70 @@ class UCFCrimeTrainingDataset(Dataset):
             print(f"\nError reading video {video_full_path}: {e}")
             return self.__getitem__((idx + 1) % len(self))
 
-        # Dynamic Temporal Cropping
+        # --------------------------------------------------------
+        # 1. PURE NORMAL VIDEOS
+        # --------------------------------------------------------
         if label == "Normal":
-            max_start = max(0.0, total_sec - self.window_size_sec)
-            start_sec = random.uniform(0, max_start)
-            # Force the model to learn that Normal = 0.00
-            target_text = "[Probability: 0.00] This is a normal surveillance video with no anomalies."
+            idx_choice = random.randint(0, len(sentences) - 1)
+            ano_start, ano_end = timestamps[idx_choice]
+
+            # Safely unpack the dictionary structure created by the LLM labeler
+            sentence_obj = sentences[idx_choice]
+            specific_action = sentence_obj["text"] if isinstance(sentence_obj, dict) else sentence_obj
+
+            target_text = f"No.\n{specific_action}. The scene appears completely peaceful and there is no suspicious or anomalous behavior occurring."
+
+            min_start = max(0.0, ano_start - (self.window_size_sec / 2))
+            max_start = min(ano_end, total_sec - self.window_size_sec)
+            start_sec = random.uniform(min_start, max_start) if max_start > min_start else ano_start
+
+        # --------------------------------------------------------
+        # 2. ANOMALY VIDEOS (Intra-Video Negative Sampling via LLM Labels)
+        # --------------------------------------------------------
         else:
-            # Force the 10-second window to overlap with the UCA ground truth anomaly
-            sentences = item.get("uca_data", {}).get("sentences", [])
-            if not sentences:
-                print(f"Skipping {video_filename}: No UCA text description found.")
-                return self.__getitem__((idx + 1) % len(self))
-            base_desc = sentences[0]
+            positive_pool = []
+            negative_pool = []
 
-            # Force the model to learn that Anomaly = 1.00
-            target_text = f"[Probability: 1.00] {base_desc}"
+            # Segregate annotations using Llama 3's pre-calculated boolean flags
+            for i, (t_start, t_end) in enumerate(timestamps):
+                sentence_obj = sentences[i]
 
-            timestamps = item.get("uca_data", {}).get("timestamps", [])
-            if timestamps and len(timestamps[0]) == 2:
-                ano_start, ano_end = timestamps[0]
-                min_start = max(0.0, ano_start - (self.window_size_sec / 2))
-                max_start = min(ano_end, total_sec - self.window_size_sec)
-                start_sec = random.uniform(min_start, max_start) if max_start > min_start else ano_start
+                # Check if the sentence has been processed into a dictionary by our script
+                if isinstance(sentence_obj, dict):
+                    desc = sentence_obj["text"]
+                    is_ano = sentence_obj.get("is_anomaly", False)
+                else:
+                    # Fallback if raw un-labeled JSON is accidentally passed
+                    desc = sentence_obj
+                    is_ano = False
+
+                if is_ano:
+                    positive_pool.append((t_start, t_end, desc))
+                else:
+                    negative_pool.append((t_start, t_end, desc))
+
+            # 50% chance for an Anomaly (Yes), 50% chance for Background (No)
+            if random.random() > 0.5 and positive_pool:
+                # POSITIVE SAMPLE
+                chosen_start, chosen_end, desc = random.choice(positive_pool)
+                target_text = f"Yes.\n{desc}"
+
+                min_start = max(0.0, chosen_start - (self.window_size_sec / 2))
+                max_start = min(chosen_end, total_sec - self.window_size_sec)
+                start_sec = random.uniform(min_start, max_start) if max_start > min_start else chosen_start
+
+            elif negative_pool:
+                # NEGATIVE SAMPLE (Peaceful background interval from the same anomaly video)
+                chosen_start, chosen_end, desc = random.choice(negative_pool)
+                target_text = f"No.\n{desc}. The scene appears peaceful with no suspicious or anomalous behavior."
+
+                min_start = max(0.0, chosen_start - (self.window_size_sec / 2))
+                max_start = min(chosen_end, total_sec - self.window_size_sec)
+                start_sec = random.uniform(min_start, max_start) if max_start > min_start else chosen_start
+
             else:
-                start_sec = 0.0
+                # Fallback if pools are empty
+                return self.__getitem__((idx + 1) % len(self))
 
         frames = self._extract_window(vr, start_sec, fps, total_frames)
         if frames is None:

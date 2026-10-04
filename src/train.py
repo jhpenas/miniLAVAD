@@ -1,5 +1,6 @@
 import sys
 from pathlib import Path
+import tempfile
 import torch
 from torch.utils.data import DataLoader
 from transformers import (
@@ -11,17 +12,11 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from omegaconf import OmegaConf
 import mlflow
 from qwen_vl_utils import process_vision_info
+
 # Local imports
 project_root = Path(__file__).resolve().parents[1]
 sys.path.append(str(project_root / "src"))
 from dataset import UCFCrimeTrainingDataset
-
-# Critical VRAM Protections Built Into This Loop
-# set_to_none=True on Gradients: Instead of zeroing out gradient tensors, setting them to None immediately deallocates memory on the GPU.
-#
-# Explicit Tensor Deletion: The variables outputs, loss, and batch are explicitly unlinked and purged via torch.cuda.empty_cache() at every iteration to eliminate memory leaks across video sequences.
-#
-# Targeted Label Masking: Padding tokens are masked with -100, instructing PyTorch’s cross-entropy loss to bypass non-informative tokens and conserve computation.
 
 
 def collate_fn(batch, processor):
@@ -30,13 +25,10 @@ def collate_fn(batch, processor):
     video_inputs = []
 
     for item in batch:
-        # Construct ChatML sequence: Prompt (User) -> Target Explanation (Assistant)
         messages = [
             {
                 "role": "user",
                 "content": [
-                    # apply_chat_template only looks at the "type" to insert <|video_pad|> tokens.
-                    # Using a dummy path since dataset.py already extracted the frames.
                     {"type": "video", "video": "dummy_path.mp4"},
                     {"type": "text", "text": item["prompt"]}
                 ]
@@ -49,27 +41,29 @@ def collate_fn(batch, processor):
             }
         ]
 
-        # Generate text prompt with special vision tokens
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
         formatted_texts.append(text)
-
-        # Bypass process_vision_info and directly append the frames from dataset.py
         video_inputs.append(item["frames"])
 
-    # Tokenize and encode multimodal inputs natively
     inputs = processor(
         text=formatted_texts,
-        videos=video_inputs, #the video tensors enter here, ignoring the dummy path on apply_chat_template
+        videos=video_inputs,
         padding=True,
         return_tensors="pt",
-        cap_pixels_per_frame=True  # Enforces safe token counts
+        cap_pixels_per_frame=True
     )
 
-    # Create target labels for loss computation (masking padding tokens with -100)
     labels = inputs["input_ids"].clone()
     labels[labels == processor.tokenizer.pad_token_id] = -100
-    inputs["labels"] = labels
 
+    # PROMPT MASKING: Only calculate loss on the assistant's response
+    for i in range(labels.shape[0]):
+        im_start_indices = (labels[i] == 151644).nonzero(as_tuple=True)[0]
+        if len(im_start_indices) > 0:
+            assistant_header_end = im_start_indices[-1] + 3
+            labels[i, :assistant_header_end] = -100
+
+    inputs["labels"] = labels
     return inputs
 
 
@@ -135,9 +129,15 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(config.training.learning_rate))
     scaler = torch.cuda.amp.GradScaler()
 
-    # 7. Native Training Loop
-    with mlflow.start_run() as run:
+    # 7. Native Training Loop tracked by MLflow
+    run_name = config.get("run_name", "v3_lr5e-6")
+    with mlflow.start_run(run_name=run_name) as run:
+        print(f"MLflow Run started: {run.info.run_id} ({run_name})")
+
+        # Log parameters and original config file
         mlflow.log_params(OmegaConf.to_container(config, resolve=True))
+        mlflow.log_artifact(str(config_path), artifact_path="configuration")
+
         global_step = 0
 
         for epoch in range(config.training.epochs):
@@ -146,19 +146,15 @@ def main():
             epoch_loss = 0.0
 
             for step, batch in enumerate(train_loader):
-                # Move tensors to GPU
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-                # Forward pass with mixed precision
                 with torch.amp.autocast('cuda', dtype=torch.float16):
                     outputs = model(**batch)
                     loss = outputs.loss / config.training.gradient_accumulation_steps
 
-                # Backward pass
                 scaler.scale(loss).backward()
                 epoch_loss += loss.item() * config.training.gradient_accumulation_steps
 
-                # Gradient accumulation step
                 if (step + 1) % config.training.gradient_accumulation_steps == 0:
                     scaler.step(optimizer)
                     scaler.update()
@@ -169,7 +165,6 @@ def main():
                     mlflow.log_metric("train_loss", current_loss, step=global_step)
                     print(f"Epoch [{epoch + 1}/{config.training.epochs}] Step [{step + 1}] - Loss: {current_loss:.4f}")
 
-                # Immediate memory cleanup to protect VRAM
                 del outputs, loss, batch
                 torch.cuda.empty_cache()
 
@@ -177,25 +172,21 @@ def main():
             mlflow.log_metric("epoch_loss", avg_epoch_loss, step=epoch)
             print(f"--- Epoch {epoch + 1} Complete | Average Loss: {avg_epoch_loss:.4f} ---")
 
-            # Mid-Training Checkpointing
-            checkpoint_dir = project_root / config.training.output_dir / f"checkpoint-epoch-{epoch + 1}"
-            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            # Ephemeral Mid-Training Checkpointing
+            print(f"Securing Epoch {epoch + 1} checkpoint to MLflow...")
+            with tempfile.TemporaryDirectory() as temp_dir:
+                model.save_pretrained(temp_dir)
+                mlflow.log_artifacts(temp_dir, artifact_path=f"checkpoints/epoch_{epoch + 1}")
+            print(f"Epoch {epoch + 1} checkpoint uploaded and local cache cleaned.")
 
-            print(f"Saving checkpoint to {checkpoint_dir}...")
-            # This only saves the lightweight LoRA adapters, not the massive base model
-            model.save_pretrained(str(checkpoint_dir))
+        # 8. Ephemeral Final Model Checkpointing
+        print("Securing final adapter and processor to MLflow...")
+        with tempfile.TemporaryDirectory() as temp_dir:
+            model.save_pretrained(temp_dir)
+            processor.save_pretrained(temp_dir)
+            mlflow.log_artifacts(temp_dir, artifact_path="final_adapter")
 
-            # Instantly upload to local MLflow server
-            mlflow.log_artifacts(str(checkpoint_dir), artifact_path=f"checkpoints/epoch_{epoch + 1}")
-            print(f"Epoch {epoch + 1} checkpoint secured!")
-
-
-        # 8. Save Checkpoint Artifact
-        output_dir = project_root / config.training.output_dir
-        output_dir.mkdir(parents=True, exist_ok=True)
-        model.save_pretrained(str(output_dir / "final_adapter"))
-        mlflow.log_artifacts(str(output_dir / "final_adapter"), artifact_path="lora_adapters")
-        print("Training complete! Adapter weights saved and logged to MLflow.")
+        print("Training complete! All weights and configs safely recorded in MLflow.")
 
 
 if __name__ == "__main__":

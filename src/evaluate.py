@@ -10,6 +10,7 @@ from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, BitsAnd
 from peft import PeftModel
 from decord import VideoReader, cpu
 import torch.nn.functional as F
+import mlflow
 
 
 def load_cctv_model(base_model_id="Qwen/Qwen2-VL-2B-Instruct", adapter_path=None, use_quantization=True):
@@ -114,7 +115,7 @@ def apply_dynamic_boundaries(raw_scores, total_frames, window_size=60, suppressi
     return amplified.tolist()
 
 
-def run_evaluation(model, processor, args):
+def run_evaluation(model, processor, args, resolved_adapter_path=None):
     print("Indexing physical video files in data/raw/...")
     video_index = {}
     for root, dirs, files in os.walk(os.path.join("data", "raw")):
@@ -247,11 +248,14 @@ def run_evaluation(model, processor, args):
 
     final_output = {
         "__metadata__": {
-            "adapter_path": args.adapter_path,
+            "run_id": args.run_id,
+            "artifact_epoch": args.epoch,
+            "adapter_path": str(resolved_adapter_path),
             "quantized": not args.no_quantize,
             "max_frames": args.max_frames,
             "smoothing_window": args.smoothing_window,
             "suppression_power": args.suppression_power,
+            "temperature": args.temperature,
             "total_inference_time_seconds": round(time.time() - total_eval_start, 2),
             "evaluation_date": time.strftime("%Y-%m-%d %H:%M:%S"),
             "video_timings_seconds": video_timings
@@ -260,21 +264,33 @@ def run_evaluation(model, processor, args):
         "raw_captions": raw_captions
     }
 
+    # Ensure the output directory exists before saving
+    output_dir = os.path.dirname(args.output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
     with open(args.output_file, 'w', encoding='utf-8') as f:
         json.dump(final_output, f, indent=4)
 
     print(f"Evaluation complete! Results saved to {args.output_file}")
 
+    # Attach evaluation JSON back to the MLflow Run
+    if args.run_id:
+        print("Uploading evaluation results to MLflow artifact store...")
+        mlflow.log_artifact(args.output_file, artifact_path="evaluations")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="miniLAVAD Evaluation & Ablation Script")
-    parser.add_argument("--adapter_path", type=str, default=None)
+    parser.add_argument("--run_id", type=str, default=None, help="MLflow Run ID to evaluate")
+    parser.add_argument("--epoch", type=str, default="final_adapter",
+                        help="Target artifact folder (e.g. 'final_adapter', 'lora_adapters', 'checkpoints/epoch_2')")
+    parser.add_argument("--adapter_path", type=str, default=None, help="Direct path to local checkpoint (fallback)")
     parser.add_argument("--no_quantize", action="store_true")
     parser.add_argument("--test_json", type=str, default="data/processed/test_split.json")
     parser.add_argument("--output_file", type=str, default="models/eval_results.json")
     parser.add_argument("--max_frames", type=int, default=10)
 
-    # New Signal Processing Parameters
+    # Signal Processing Parameters
     parser.add_argument("--smoothing_window", type=int, default=60,
                         help="Size of the rolling average window (1 = no smoothing)")
     parser.add_argument("--suppression_power", type=float, default=2.0,
@@ -286,9 +302,29 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Priority: MLflow download if run_id provided; otherwise local fallback
+    adapter_path = args.adapter_path
+
+    if args.run_id:
+        print(f"Connecting to MLflow to retrieve model for Run ID: {args.run_id}")
+        mlflow.set_tracking_uri("http://127.0.0.1:5000")
+
+        # Set active run context so logged artifacts link directly to this run
+        mlflow.start_run(run_id=args.run_id)
+
+        adapter_path = mlflow.artifacts.download_artifacts(
+            run_id=args.run_id,
+            artifact_path=args.epoch
+        )
+        print(f"Model successfully loaded from MLOps cache: {adapter_path}")
+
     cctv_model, vlm_processor = load_cctv_model(
-        adapter_path=args.adapter_path,
+        adapter_path=adapter_path,
         use_quantization=not args.no_quantize
     )
 
-    run_evaluation(cctv_model, vlm_processor, args)
+    try:
+        run_evaluation(cctv_model, vlm_processor, args, resolved_adapter_path=adapter_path)
+    finally:
+        if args.run_id:
+            mlflow.end_run()

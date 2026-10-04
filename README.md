@@ -17,38 +17,59 @@ Create a .env file in the root of the project to store your access tokens for do
 touch .env
 ```
 
-Add the following line to your .env file:
+Add the following line to .env file:
 ```bash
 DROPBOX_ACCESS_TOKEN=your_token_here
 ```
 
-### 3. Data Engineering Pipeline
+### 3. Data Engineering Pipeline (scripts/)
 Run the following scripts in sequential order to set up the dataset. The pipeline is designed to be idempotent (it will safely skip files that are already downloaded or extracted).
 
-- `python scripts/00_setup_project.py`
+#### Setup Project (`00_setup_project.py`)
 Initializes the local project architecture by creating the necessary data/ and models/ directory structures that are ignored by .gitignore.
 
-- `python scripts/01_download_data.py`
+#### Download UCF-Crime Dataset (`01_download_data.py`)
 Handles all network ingestion. Downloads the UCF-Crime .mp4 video archives from the original authors' Dropbox and recursively pulls the UCA temporal annotations directly from GitHub. (Requires DROPBOX_ACCESS_TOKEN).
 
-- `python scripts/02_extract_dataset.py`
+#### Unzip Dataset (`02_extract_dataset.py`)
 Unzips the downloaded UCF-Crime video archives into the data/raw/ directory with progress tracking and corruption handling.
 
-- `python scripts/03_build_splits.py`
+#### Build Train/Test/Validation Splits (`03_build_splits.py`)
 Generates the VLM-ready JSON splits (train_split.json, val_split.json, test_split.json). It isolates the exact test baseline from the original UCF-Crime Anomaly_Test.txt to guarantee strict benchmarking compliance, automatically converting the original frame-level annotations into precise second-based timestamps (adhering to the original authors' specified 30 FPS). It then deduces the training and validation sets from the remaining videos, mapping them to the rich temporal sentence annotations provided by the UCA dataset.
 
+#### Automated UCA Temporal Labeling (`04_llm_labeler.py`)
+
+To overcome the lack of fine-grained temporal anomaly annotations in the training split of the UCF-Crime dataset, this project utilizes dense chronological captions from the **UCA dataset**. 
+
+Instead of relying on fragile keyword heuristics, this script uses a local Large Language Model (Llama 3) via Ollama to semantically classify every UCA sentence into binary anomaly states (`is_anomaly: true/false`). This allows the data loader to perform **Intra-Video Negative Sampling**—feeding the Vision-Language Model both true anomaly intervals and peaceful background intervals from the same video to eliminate shortcut learning (filename bias).
+
+This script runs entirely offline on local hardware to preserve GPU memory for model training. It requires **Ollama** and the **Llama 3** model.
+
+1. **Install Ollama**:
+   ```bash
+   curl -fsSL [https://ollama.com/install.sh](https://ollama.com/install.sh) | sh
+  
+3. **Pull and run Llama 3 locally**:
+  ```bash
+  ollama run llama3 
+  ```
+
+4 **Run the py script**:
+  ```bash
+  python scripts/04_llm_labeler.py
+  ```
+This script includes a memoization cache to eliminate redundant inferences for repeated mundane actions (e.g., "A man is walking"), processing the entire dataset in minutes and outputting a structured JSON file ready for training.
 ### 4. Training & Evaluation Engine (src/)
 The core machine learning pipeline is intentionally decoupled into distinct scripts. This design is highly optimized for resource-constrained environments (e.g., fine-tuning on an 8 GB RTX 4060), ensuring stability without sacrificing methodological rigor.
-- `python src/dataset.py`
+#### `dataset.py`
 Implements a custom PyTorch Dataset (UCFCrimeTrainingDataset). It loads raw .mp4 files, extracts a specific number of frames over a defined temporal window, and formats the inputs into ChatML dictionaries mapped to the UCA text annotations.
 Dynamically processing multimodal data prevents the system from loading entire surveillance videos into memory at once. Furthermore, it completely bypasses Hugging Face's default video fetchers, allowing us to safely feed pre-processed tensor frames directly to Qwen2-VL's processor. This guarantees that visual token counts remain strictly bounded (cap_pixels_per_frame) before they ever hit the GPU.
 
-- `python src/train.py`
+#### `train.py`
 The primary optimization engine. It loads the Qwen2-VL base model using 4-bit NF4 quantization, injects qLoRA adapter matrices, and executes a native PyTorch training loop over the training split.
 This script explicitly avoids high-level wrappers like Hugging Face's SFTTrainer. SFTTrainer abstracts gradient accumulation and caching in ways that cause unpredictable VRAM spikes during multimodal training. By writing a native loop, we enforce aggressive, surgical memory management—specifically utilizing torch.cuda.empty_cache() and set_to_none=True after every single batch. This guarantees the 2.2B parameter model trains stably within an 8 GB VRAM ceiling. Additionally, it forces mid-training checkpoints at the end of every epoch to prevent data loss.
 
-- `python src/evaluate.py`
-### `evaluate.py` (CCTV Inference & Signal Processing Engine)
+#### `evaluate.py` (CCTV Inference & Signal Processing Engine)
 
 `python src/evaluate.py [ARGS]`
 
@@ -58,7 +79,7 @@ Evaluation and validation are completely decoupled from the `train.py` script. R
 
 Beyond hardware protection, this script implements a highly specialized pipeline to convert discrete autoregressive text generation into a continuous, frame-accurate mathematical signal for VAD (Video Anomaly Detection) metrics:
 
-#### Core Methodologies
+##### Core Methodologies
 
 * **Mathematical Logit Extraction:** Instead of relying on brittle string parsing (which is highly vulnerable to VLM hallucination and format bias), the script bypasses the text output entirely for its mathematical scoring. It extracts the raw neural activation logits for the exact token IDs of `Yes` and `No` at the first generation step, applying a Softmax function to calculate a precise continuous probability (e.g., `0.1523`) of an anomaly.
 * **Temperature Scaling for VLM Overconfidence:** Foundational VLMs are heavily polarized, frequently pushing negative logits below PyTorch's 16-bit physical memory limit (`-65,504`), resulting in `-Infinity` underflows and snapping probabilities to a hard `0.0` or `1.0`. The script implements a configurable Temperature Scaling factor (`--temperature`) to soften logit overconfidence, preserving the model's true underlying uncertainty for highly accurate ROC-AUC curves.
@@ -68,7 +89,7 @@ Beyond hardware protection, this script implements a highly specialized pipeline
   2. **Temporal Smoothing:** Applies a rolling average to eliminate transient logit spikes.
   3. **Non-Linear Suppression:** Applies power crushing to suppress low-confidence background noise while preserving high-confidence anomaly spikes.
 
-#### Command Line Arguments
+##### Command Line Arguments
 
 | Argument | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
