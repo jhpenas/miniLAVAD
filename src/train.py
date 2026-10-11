@@ -216,13 +216,14 @@ def main():
             # epoch is a fully functional, deployable model.
             components = {
                 "model": model,
-                "processor": processor
+                "tokenizer": processor.tokenizer,
+                "image_processor": processor.image_processor
             }
 
             # Log natively, using the dynamic epoch number for the path
             mlflow.transformers.log_model(
                 transformers_model=components,
-                artifact_path=f"checkpoints/epoch_{epoch + 1}",
+                artifact_path=f"checkpoints_epoch_{epoch + 1}",
                 task="text-generation"
             )
 
@@ -233,13 +234,14 @@ def main():
 
         components = {
             "model": model,
-            "processor": processor
+            "tokenizer": processor.tokenizer,
+            "image_processor": processor.image_processor
         }
 
         mlflow.transformers.log_model(
             transformers_model=components,
             artifact_path="final_adapter",
-            task="text-generation"  # Tells MLflow what kind of pipeline this is
+            task="text-generation"  # MLflow kind of pipeline
         )
 
         print("Training complete! All weights and configs safely recorded in MLflow.")

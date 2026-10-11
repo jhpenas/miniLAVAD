@@ -37,6 +37,16 @@ def load_cctv_model(base_model_id="Qwen/Qwen2-VL-2B-Instruct", adapter_path=None
         )
 
     if adapter_path and os.path.exists(adapter_path):
+        # Check if weights are nested inside the new MLflow 'model/' structure
+        found_path = None
+        for root_dir, dirs, files in os.walk(adapter_path):
+            if "adapter_config.json" in files:
+                found_path = root_dir
+                break
+
+        if found_path:
+            adapter_path = found_path
+
         print(f"[Config] Injecting LoRA adapters from: {adapter_path}")
         model = PeftModel.from_pretrained(base_model, adapter_path)
     else:
@@ -107,10 +117,6 @@ def apply_dynamic_boundaries(raw_scores, total_frames, window_size=60, suppressi
     else:
         amplified = smoothed
 
-    # Normalize safely back to [0, 1] probability curve
-    max_val = np.max(amplified)
-    if max_val > 0:
-        amplified = amplified / max_val
 
     return amplified.tolist()
 
@@ -250,6 +256,7 @@ def run_evaluation(model, processor, args, resolved_adapter_path=None):
         "__metadata__": {
             "run_id": args.run_id,
             "artifact_epoch": args.epoch,
+            "evaluated_dataset": args.test_json,
             "adapter_path": str(resolved_adapter_path),
             "quantized": not args.no_quantize,
             "max_frames": args.max_frames,

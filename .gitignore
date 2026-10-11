@@ -10,9 +10,10 @@ models/
 *.mp4
 *.jpg
 *.png
+*.sh
 
 #notebooks
-notebooks/
+#notebooks/
 
 # MLOps Tracking
 mlruns/
