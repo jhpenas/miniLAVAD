@@ -80,25 +80,36 @@ def main():
     mlflow.set_tracking_uri("http://127.0.0.1:5000")
     mlflow.set_experiment(config.project_name)
 
-    # 3. Setup 4-bit Quantization (NF4)
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=config.model.load_in_4bit,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True
-    )
+    # 3. Load Base Model (4-bit QLoRA vs. Unquantized FP16/BF16 LoRA)
+    use_4bit = bool(config.model.get("load_in_4bit", True))
+    compute_dtype = torch.bfloat16 if (not use_4bit and torch.cuda.is_bf16_supported()) else torch.float16
 
-    print("Loading base Qwen2-VL-2B model in 4-bit...")
+    print(f"Loading Qwen2-VL-2B model | 4-bit (NF4): {use_4bit} | dtype: {compute_dtype}")
     processor = AutoProcessor.from_pretrained(config.model.name_or_path)
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
-        config.model.name_or_path,
-        quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.float16
-    )
 
-    # 4. Inject qLoRA Adapters
-    model = prepare_model_for_kbit_training(model)
+    if use_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True
+        )
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            config.model.name_or_path,
+            quantization_config=bnb_config,
+            device_map="auto",
+            torch_dtype=torch.float16
+        )
+        model = prepare_model_for_kbit_training(model)
+    else:
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            config.model.name_or_path,
+            device_map="auto",
+            torch_dtype=compute_dtype
+        )
+        model.gradient_checkpointing_enable()
+
+    # 4. Inject LoRA Adapters
     lora_config = LoraConfig(
         r=config.lora.r,
         lora_alpha=config.lora.alpha,
@@ -142,7 +153,8 @@ def main():
 
     # 6. Optimizer & Mixed Precision
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(config.training.learning_rate))
-    scaler = torch.cuda.amp.GradScaler()
+    use_scaler = (compute_dtype == torch.float16)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
     # 7. Native Training Loop tracked by MLflow
     run_name = config.get("run_name", "v3_lr5e-6")
@@ -163,7 +175,7 @@ def main():
             for step, batch in enumerate(train_loader):
                 batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
-                with torch.amp.autocast('cuda', dtype=torch.float16):
+                with torch.amp.autocast('cuda', dtype=compute_dtype):
                     outputs = model(**batch)
                     loss = outputs.loss / config.training.gradient_accumulation_steps
 
@@ -200,7 +212,7 @@ def main():
                 for val_batch in val_loader:
                     val_batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in val_batch.items()}
 
-                    with torch.amp.autocast('cuda', dtype=torch.float16):
+                    with torch.amp.autocast('cuda', dtype=compute_dtype):
                         val_outputs = model(**val_batch)
                         epoch_val_loss += val_outputs.loss.item()
 
